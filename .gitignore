@@ -1,0 +1,5 @@
+nimcache/
+*.exe
+
+# Test binaries
+tests/test_finz
