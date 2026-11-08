@@ -551,7 +551,7 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
     client.info("Verifying payee name")
     client.debug("VoP polling with pollingId=" & vopPollingId & " offset=" & vopOffset & " waitSec=" & $vopWaitSec)
 
-    for attempt in 0 ..< 5:
+    for attempt in 0 ..< 10:
       sleep(vopWaitSec * 1000)
       client.debug("VoP poll attempt " & $(attempt + 1))
 
@@ -603,8 +603,11 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
           if hivpp.waitSec > 0:
             vopWaitSec = hivpp.waitSec
 
-      # Non-polling errors take priority
-      if otherError.len > 0 and not pollError:
+      # A specific error is the bank's verdict on the order (e.g. 9000
+      # "Verarbeitung fehlgeschlagen" when the VoP check could not be
+      # completed); the generic 9050 that accompanies it must not downgrade
+      # it to "polling not supported".
+      if otherError.len > 0:
         result.errorCode = otherErrorCode
         result.errorMsg = otherError
         return
