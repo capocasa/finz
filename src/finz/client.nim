@@ -1,6 +1,7 @@
 ## FinTS client: dialog handling, transfers, TAN flows, statements.
 
 import std/[httpclient, base64, strutils, random, os]
+import std/math
 import std/net
 import finz/[types, wire, pain, statement]
 
@@ -21,6 +22,7 @@ type
     hktanVersion*: int  # HKTAN segment version (6 or 7)
     hkkazVersion*: int  # HKKAZ segment version (5, 6, or 7)
     hicazVersion*: int  # HICAZ segment version (1 or 2)
+    hisalVersion*: int  # HKSAL segment version (5, 6, or 7)
     hicazCamtUrn*: string  # camt URN for HICAZ (e.g., urn:iso:std:iso:20022:tech:xsd:camt.052.001.08)
     vopReportFormat*: string  # VoP report format from HIVPPS
     vopRequired*: bool  # Whether VoP is required for transfers
@@ -212,6 +214,9 @@ proc initDialog*(client: var FintsClient): bool =
     elif seg.name == "HIIPZS":  # SEPA instant payment info
       client.bankParams.supportsInstantPayment = true
       client.debug("HIIPZS data: " & $seg.data)
+    elif seg.name == "HIIPMS":  # SEPA instant Sammelüberweisung (HKIPM)
+      client.bankParams.supportsInstantBatch = true
+      client.debug("HIIPMS data: " & $seg.data)
     elif seg.name == "HISPAS":
       client.debug("HISPAS data: " & $seg.data)
     elif seg.name == "HICCSS":
@@ -267,6 +272,11 @@ proc initDialog*(client: var FintsClient): bool =
             else:
               client.hicazCamtUrn = allUrns
         client.debug("HICAZ version " & $seg.version & " supported, URN: " & client.hicazCamtUrn)
+    elif seg.name == "HISALS":
+      # HISALS is the BPD parameter segment for HKSAL (balance query)
+      if seg.version > client.hisalVersion:
+        client.hisalVersion = seg.version
+        client.debug("HKSAL version " & $seg.version & " supported")
     elif seg.name == "HISYN":
       # Synchronization response - extract system ID
       if seg.data.len > 0 and seg.data[0].len > 0:
@@ -388,7 +398,7 @@ proc endDialog*(client: var FintsClient) =
       discard  # Dialog may already be closed by bank
     client.dialogId = "0"
 
-proc parseHIVPP(seg: Segment, client: FintsClient): tuple[vopId, pollingId, resultCode, differentName: string, waitSec: int] =
+proc parseHIVPP(seg: Segment, client: FintsClient): tuple[vopId, pollingId, resultCode, differentName: string, waitSec: int, items: seq[VopItem]] =
   ## Parse HIVPP response fields
   ## Fields: vopid(0), vopidvalidto(1), pollingid(2), reportdesc(3), report(4), result_DEG(5), infotext(6), wait(7)
   result.waitSec = 2
@@ -407,6 +417,16 @@ proc parseHIVPP(seg: Segment, client: FintsClient): tuple[vopId, pollingId, resu
       result.pollingId = extractBinary(raw)
     else:
       result.pollingId = raw
+  # Fields 3+4: pain.002 status report — batch transfers get one result
+  # per payment instead of the single-result DEG
+  if seg.data.len > 4 and seg.data[4].len > 0:
+    let report = extractBinary(seg.data[4])
+    if report.len > 0:
+      try:
+        result.items = parseVopReport(report)
+        client.debug("HIVPP pain.002 report: " & $result.items.len & " items")
+      except CatchableError as e:
+        client.debug("HIVPP report unparseable: " & e.msg)
   # Field 5: result DEG (iban:ibanaddon:differentname:otheridentifier:result_code:reason)
   if seg.data.len > 5 and seg.data[5].len > 0:
     let parts = seg.data[5].split(':')
@@ -414,18 +434,20 @@ proc parseHIVPP(seg: Segment, client: FintsClient): tuple[vopId, pollingId, resu
       result.resultCode = parts[4]
     if parts.len >= 3 and parts[2].len > 0:
       result.differentName = parts[2]
+    if result.items.len == 0 and result.resultCode.len > 0:
+      var item = VopItem(code: result.resultCode, actualName: result.differentName)
+      if parts.len >= 1: item.iban = parts[0]
+      result.items = @[item]
   # Field 7: wait seconds
   if seg.data.len > 7 and seg.data[7].len > 0:
     try:
       result.waitSec = parseInt(seg.data[7])
     except: discard
 
-proc transfer*(client: var FintsClient, request: TransferRequest): TransferResult =
-  ## Execute SEPA transfer (instant or standard)
-  ## Implements the correct VoP flow: Check → Poll → Auth
-  result = TransferResult(success: false)
-
-  # Ensure dialog is initialized with proper TAN method
+proc initOperationalDialog(client: var FintsClient): string =
+  ## Initialize the dialog (discovering TAN method, BPD, system ID).
+  ## Returns "" on success, else the error message.
+  result = ""
   if client.dialogId == "0":
     try:
       let oldSystemId = client.systemId
@@ -437,25 +459,51 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
         client.endDialog()
         discard client.initDialog()
     except FintsError as e:
-      result.errorMsg = e.msg
-      return
+      result = e.msg
+
+proc reportVopItems(client: FintsClient, items: seq[VopItem]) =
+  ## Surface payee verification results to the user. Non-matches are
+  ## warnings, not errors — the payment still goes out (consistent with
+  ## single transfers).
+  for item in items:
+    let who = if item.submittedName.len > 0: " (" & item.submittedName & ")" else: ""
+    case item.code
+    of "RVNM":
+      client.prompt("warning: payee name does NOT match" & who)
+    of "RVMC":
+      if item.actualName.len > 0:
+        client.prompt("payee name close match, bank suggests: " & item.actualName & who)
+    of "RVNA":
+      client.info("Receiving bank does not support payee verification" & who)
+    of "RCVC", "":
+      discard  # Match or not provided — proceed normally
+    else:
+      client.debug("VoP result code: " & item.code & who)
+
+proc submitJob(client: var FintsClient, painXml, jobCode: string,
+               jobSeg: proc (segNum: int): string): TransferResult =
+  ## Send one payment job (HKIPZ single or HKIPM batch) through the VoP
+  ## flow: Check (HKVPP), Poll, Auth (HKVPA), TAN via HKTAN process 4.
+  result = TransferResult(success: false)
+
+  let initErr = client.initOperationalDialog()
+  if initErr.len > 0:
+    result.errorMsg = initErr
+    return
 
   let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
   let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
 
-  # Step 1: Send HKVPP (VoP Check) + HKIPZ (transfer) + HKTAN (process 4)
+  # Step 1: Send HKVPP (VoP Check) + payment job + HKTAN (process 4)
   var vopId = ""
   var vopPollingId = ""
   var vopWaitSec = 2
-  var vopResultCode = ""
-  var vopDifferentName = ""
+  var vopItems: seq[VopItem] = @[]
   var vopOffset = ""
   var vopPending = false
   var skipVopAuth = false
 
-  # Generate pain.001 XML once — must be identical in Step 1 and Step 3
-  let transferMessageId = generateReference()
-  let painXml = generatePain001(request, client.account, transferMessageId)
+  # The pain.001 XML must be identical in Step 1 and Step 3
   client.debug("pain.001 XML:\n" & painXml)
 
   block:
@@ -470,10 +518,10 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
       segments.add buildHKVPP(segNum, client.vopReportFormat)
       segNum += 1
 
-    segments.add buildHKIPZFromPain(segNum, client.account, painXml)
+    segments.add jobSeg(segNum)
     segNum += 1
 
-    segments.add buildHKTAN(segNum, "4", "HKIPZ", version = hktanVer)
+    segments.add buildHKTAN(segNum, "4", jobCode, version = hktanVer)
     segNum += 1
 
     segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
@@ -520,8 +568,8 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
         vopId = hivpp.vopId
         vopPollingId = hivpp.pollingId
         vopWaitSec = hivpp.waitSec
-        vopResultCode = hivpp.resultCode
-        vopDifferentName = hivpp.differentName
+        if hivpp.items.len > 0:
+          vopItems = hivpp.items
 
     if result.errorCode.len > 0:
       result.success = false
@@ -595,9 +643,9 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
           let hivpp = parseHIVPP(seg, client)
           if hivpp.vopId.len > 0:
             vopId = hivpp.vopId
-            vopResultCode = hivpp.resultCode
-            vopDifferentName = hivpp.differentName
             gotVopId = true
+          if hivpp.items.len > 0:
+            vopItems = hivpp.items
           if hivpp.pollingId.len > 0:
             vopPollingId = hivpp.pollingId
           if hivpp.waitSec > 0:
@@ -631,20 +679,10 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
       return result
 
   # Handle VoP result codes
-  case vopResultCode
-  of "RVNM":
-    client.prompt("warning: payee name does NOT match")
-  of "RVMC":
-    if vopDifferentName.len > 0:
-      client.prompt("payee name close match, bank suggests: " & vopDifferentName)
-  of "RVNA":
-    client.info("Receiving bank does not support payee verification")
-  of "RCVC", "":
-    discard  # Match or not provided — proceed normally
-  else:
-    client.debug("VoP result code: " & vopResultCode)
+  reportVopItems(client, vopItems)
+  result.vopItems = vopItems
 
-  # Step 3: Send HKVPA (VoP Auth with vopId) + HKIPZ (transfer again) + HKTAN
+  # Step 3: Send HKVPA (VoP Auth with vopId) + payment job + HKTAN
   block:
     var segments = ""
     var segNum = 2
@@ -656,10 +694,10 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
     segments.add buildHKVPA(segNum, vopId)
     segNum += 1
 
-    segments.add buildHKIPZFromPain(segNum, client.account, painXml)
+    segments.add jobSeg(segNum)
     segNum += 1
 
-    segments.add buildHKTAN(segNum, "4", "HKIPZ", version = hktanVer)
+    segments.add buildHKTAN(segNum, "4", jobCode, version = hktanVer)
     segNum += 1
 
     segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
@@ -702,6 +740,43 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
       return result
 
   return result
+
+proc transfer*(client: var FintsClient, request: TransferRequest): TransferResult =
+  ## Execute SEPA transfer (instant or standard)
+  ## Implements the correct VoP flow: Check, Poll, Auth
+  let messageId = generateReference()
+  let painXml = generatePain001(request, client.account, messageId)
+  let account = client.account
+  result = client.submitJob(painXml, "HKIPZ",
+    proc (segNum: int): string = buildHKIPZFromPain(segNum, account, painXml))
+
+proc transferBatch*(client: var FintsClient, payments: seq[TransferRequest]): TransferResult =
+  ## Execute a SEPA instant batch transfer (Sammelüberweisung, HKIPM):
+  ## all payments in one pain.001, one TAN for the whole batch.
+  result = TransferResult(success: false)
+  if payments.len == 0:
+    result.errorMsg = "batch transfer needs at least one payment"
+    return
+
+  # The BPD (parsed during dialog init) must advertise HKIPM; instant
+  # batch only, by design — no HKCCM fallback.
+  let initErr = client.initOperationalDialog()
+  if initErr.len > 0:
+    result.errorMsg = initErr
+    return
+  if not client.bankParams.supportsInstantBatch:
+    client.endDialog()
+    result.errorMsg = "bank does not support instant batch transfers (HKIPM)"
+    return
+
+  let messageId = generateReference()
+  let painXml = generatePain001Batch(payments, client.account, messageId)
+  var totalCents = 0
+  for p in payments:
+    totalCents += (p.amount * 100).round.int
+  let account = client.account
+  result = client.submitJob(painXml, "HKIPM",
+    proc (segNum: int): string = buildHKIPM(segNum, account, totalCents / 100, painXml))
 
 proc submitTan*(client: var FintsClient, orderRef: string, tan: string): TransferResult =
   ## Submit TAN for pending transfer
@@ -1251,6 +1326,178 @@ proc getStatements*(client: var FintsClient, fromDate, toDate: string): Statemen
 
   # Neither supported
   result.errorMsg = "Bank does not advertise HICAZ or HKKAZ support"
+
+proc sendHKSAL(client: var FintsClient, withTan: bool): BalanceResult =
+  ## Send one HKSAL job and parse the HISAL response.
+  ## withTan: if true, include HKTAN process 4 for the decoupled TAN flow.
+  result = BalanceResult(success: false)
+
+  let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
+  let hksalVer = if client.hisalVersion > 0: client.hisalVersion else: 7
+  let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
+
+  client.debug("Using HKSAL version " & $hksalVer)
+
+  var segments = ""
+  var segNum = 2
+  let secRef = $rand(1000000..9999999)
+
+  segments.add buildHNSHK(segNum, secFunc, secRef, client.blz, client.user, client.systemId)
+  segNum += 1
+
+  segments.add buildHKSAL(segNum, client.account, version = hksalVer)
+  segNum += 1
+
+  if withTan:
+    segments.add buildHKTAN(segNum, "4", "HKSAL", version = hktanVer)
+    segNum += 1
+
+  segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
+
+  let response = client.sendMessage(segments, segNum)
+  let respSegments = parseAllSegments(response)
+
+  var gotSaldo = false
+  var hirmgError = ("", "")  # Store HIRMG error temporarily
+
+  for seg in respSegments:
+    if seg.name == "HIRMG" or seg.name == "HIRMS":
+      for de in seg.data:
+        let parsed = parseResponse(de)
+        client.debug(seg.name & ": " & parsed.code & " " & parsed.msg)
+        if parsed.code == "0010" or parsed.code == "0020" or parsed.code == "3010":
+          discard  # Success is only real once a HISAL with data arrived
+        elif parsed.code == "9370":
+          # TAN required
+          result.tanRequired = true
+        elif parsed.code.startsWith("9"):
+          if seg.name == "HIRMS":
+            # HIRMS errors are more specific, use them directly
+            result.errorCode = parsed.code
+            result.errorMsg = parsed.msg
+            return
+          else:
+            # Store HIRMG error as fallback
+            hirmgError = (parsed.code, parsed.msg)
+
+    elif seg.name == "HITAN":
+      client.debug("HITAN data: " & $seg.data)
+      if seg.data.len > 2 and seg.data[2] != "noref":
+        result.orderRef = seg.data[2]
+        if seg.data.len > 3 and seg.data[3] != "nochallenge":
+          result.tanChallenge = seg.data[3]
+        result.tanRequired = true
+
+    elif seg.name == "HISAL":
+      result.saldo = parseHISAL(seg)
+      gotSaldo = true
+
+  # If HIRMG error but no HIRMS error, use HIRMG
+  if hirmgError[0].len > 0:
+    result.errorCode = hirmgError[0]
+    result.errorMsg = hirmgError[1]
+    return
+
+  if gotSaldo:
+    result.success = true
+  else:
+    result.errorMsg = "No HISAL balance in bank response"
+
+proc getBalance*(client: var FintsClient): BalanceResult =
+  ## Query the account balance via HKSAL (handles decoupled TAN if required)
+  result = BalanceResult(success: false)
+
+  let initErr = client.initOperationalDialog()
+  if initErr.len > 0:
+    result.errorMsg = initErr
+    return
+
+  result = client.sendHKSAL(withTan = true)
+
+  # Handle decoupled TAN (SecureGo plus)
+  if result.tanRequired and result.orderRef.len > 0 and not result.success:
+    client.debug("TAN required for balance query")
+
+    if result.tanChallenge.len > 0 and result.tanChallenge != "nochallenge":
+      client.prompt(result.tanChallenge)
+    else:
+      client.prompt("approve balance query in your banking app")
+
+    # Poll for decoupled TAN confirmation
+    let pollResult = client.pollDecoupledTan(result.orderRef)
+    if pollResult.success:
+      let retryResult = client.sendHKSAL(withTan = false)
+      return retryResult
+    elif pollResult.errorCode == "POLL_UNSUPPORTED":
+      client.prompt("press Enter after approving")
+      client.wait()
+      let retryResult = client.sendHKSAL(withTan = false)
+      return retryResult
+    else:
+      result.errorCode = pollResult.errorCode
+      result.errorMsg = pollResult.errorMsg
+      return
+
+proc fetchBalance*(url, blz, user, pin, productId: string,
+                   iban, bic: string,
+                   ui: UiHooks = UiHooks()): BalanceResult =
+  ## Convenience function to query the account balance
+  var client = newFintsClient(url, blz, user, pin, productId)
+  client.ui = ui
+  defer: client.close()
+
+  client.account = Account(
+    iban: iban,
+    bic: bic,
+    blz: blz
+  )
+
+  result = client.getBalance()
+  client.endDialog()
+
+proc makeBatchTransfer*(url, blz, user, pin, productId: string,
+                        senderIban, senderBic, senderName: string,
+                        payments: seq[TransferRequest],
+                        ui: UiHooks = UiHooks()): TransferResult =
+  ## Execute a complete instant batch transfer (Sammelüberweisung) with
+  ## TAN handling. One TAN approves every payment in the batch.
+  var client = newFintsClient(url, blz, user, pin, productId)
+  client.ui = ui
+  defer: client.close()
+
+  client.account = Account(
+    iban: senderIban,
+    bic: senderBic,
+    holder: senderName,
+    blz: blz
+  )
+
+  result = client.transferBatch(payments)
+
+  # Handle decoupled TAN (SecureGo plus)
+  if result.tanRequired:
+    if result.tanChallenge.len > 0 and result.tanChallenge != "nochallenge":
+      client.prompt(result.tanChallenge)
+    else:
+      client.prompt("approve batch transfer in your banking app")
+
+    if result.orderRef.len > 0:
+      let pollResult = client.pollDecoupledTan(result.orderRef)
+      if pollResult.success:
+        result = pollResult
+      elif pollResult.errorCode == "POLL_UNSUPPORTED":
+        client.prompt("press Enter after approving")
+        client.wait()
+        # Bank already confirmed acceptance (0020) in Step 3
+        result.success = true
+      else:
+        result = pollResult
+    else:
+      client.prompt("press Enter after approving")
+      client.wait()
+      result.success = true
+
+  client.endDialog()
 
 proc fetchStatements*(url, blz, user, pin, productId: string,
                       iban, bic: string,

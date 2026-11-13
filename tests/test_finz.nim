@@ -194,5 +194,138 @@ suite "HKCAZ segment structure":
     check parts[5] == ""  # empty max_number_responses
     check "OFFSET123" in parts[6]
 
+suite "HKSAL balance":
+  test "HKSAL v7 uses KTI and all_accounts flag":
+    let account = Account(iban: "DE89370400440532013000", bic: "COBADEFFXXX", blz: "37040044")
+    let seg = buildHKSAL(3, account, version = 7)
+    # Should be: HKSAL:3:7+IBAN:BIC+N'
+    let parts = seg.split('+')
+    check parts[0] == "HKSAL:3:7"
+    check parts[1] == "DE89370400440532013000:COBADEFFXXX"
+    check parts[2] == "N'"
+    check seg.endsWith("'")
+
+  test "HKSAL v5 uses KTO":
+    let account = Account(iban: "DE89370400440532013000", bic: "COBADEFFXXX", blz: "37040044")
+    let seg = buildHKSAL(3, account, version = 5)
+    let parts = seg.split('+')
+    check parts[0] == "HKSAL:3:5"
+    check parts[1] == "532013000::280:37040044"
+    check parts[2] == "N'"
+
+  test "HISAL v7 booked/pending/available parse":
+    let hisal = "HISAL:7:4+DE89370400440532013000:COBADEFFXXX:532013000::280:37040044+Girokonto+EUR+C:1234,56:EUR:20260401:123025+C:-12,5:EUR:20260401:123025+:EUR+1500,00:EUR+1500,00:EUR'"
+    let segments = parseAllSegments(hisal)
+    check segments.len == 1
+    let saldo = parseHISAL(segments[0])
+    check saldo.balance == 1234.56
+    check saldo.currency == "EUR"
+    check saldo.date == "20260401"
+    check saldo.pending == -12.5
+    check saldo.available == 1500.00
+
+  test "HISAL debit balance is negative":
+    let hisal = "HISAL:7:4+DE89370400440532013000:COBADEFFXXX+Girokonto+EUR+D:50,00:EUR:20260401'"
+    let segments = parseAllSegments(hisal)
+    let saldo = parseHISAL(segments[0])
+    check saldo.balance == -50.0
+    check saldo.pending == 0.0
+    check saldo.available == 0.0
+
+suite "SEPA instant batch (HKIPM)":
+  setup:
+    var account {.inject.} = Account(
+      iban: "DE89370400440532013000",
+      bic: "COBADEFFXXX",
+      holder: "Max Mustermann",
+      blz: "37040044"
+    )
+
+  test "batch pain.001: totals, single PmtInf, per-tx EndToEndId":
+    let payments = @[
+      TransferRequest(recipientName: "Erika Musterfrau", recipientIban: "DE75512108001245126199",
+        amount: 100.50, currency: "EUR", reference: "Invoice 1", instant: true),
+      TransferRequest(recipientName: "Bob Bauers", recipientIban: "DE02120300000000202051",
+        amount: 10.00, currency: "EUR", reference: "", instant: true)
+    ]
+    let xml = generatePain001Batch(payments, account, "20260101120000")
+
+    check xml.contains("<NbOfTxs>2</NbOfTxs>")
+    check xml.contains("<CtrlSum>110.50</CtrlSum>")
+    check xml.count("<PmtInf>") == 1
+    check xml.count("<CdtTrfTxInf>") == 2
+    check xml.contains("<BtchBookg>false</BtchBookg>")
+    check xml.contains("<Cd>INST</Cd>")
+    check xml.contains("<EndToEndId>20260101120000-1</EndToEndId>")
+    check xml.contains("<EndToEndId>20260101120000-2</EndToEndId>")
+    # empty reference omits RmtInf entirely (Ustrd has minLength=1)
+    check xml.count("<RmtInf>") == 1
+
+  test "HKIPM segment: KTI, Summenfeld, descriptor, binary pain — no jn field":
+    let pain = "<Document>x</Document>"
+    let seg = buildHKIPM(3, account, 110.50, pain)
+    let parts = seg.split('+')
+    # header + kti + sum + descriptor + binary; an "Einzelbuchung" jn element
+    # between sum and descriptor would shift the pain and the bank answers 9130
+    check parts.len == 5
+    check parts[0] == "HKIPM:3:1"
+    check parts[1] == "DE89370400440532013000:COBADEFFXXX"
+    check parts[2] == "110,50:EUR"
+    check parts[3] == "urn?:iso?:std?:iso?:20022?:tech?:xsd?:pain.001.001.09"
+    check parts[4] == "@" & $pain.len & "@" & pain & "'"
+
+suite "VoP batch report (pain.002)":
+  test "parse per-payment results":
+    let report = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:pain.002.001.10">
+  <CstmrPmtStsRpt>
+    <GrpHdr><MsgId>R1</MsgId></GrpHdr>
+    <OrgnlGrpInfAndSts><OrgnlMsgId>M1</OrgnlMsgId></OrgnlGrpInfAndSts>
+    <OrgnlPmtInfAndSts>
+      <OrgnlPmtInfId>P1</OrgnlPmtInfId>
+      <TxInfAndSts>
+        <TxSts>RCVC</TxSts>
+        <OrgnlTxRef>
+          <Amt><InstdAmt Ccy="EUR">10.00</InstdAmt></Amt>
+          <Cdtr><Pty><Nm>Bob Bauers</Nm></Pty></Cdtr>
+          <CdtrAcct><Id><IBAN>DE02120300000000202051</IBAN></Id></CdtrAcct>
+        </OrgnlTxRef>
+      </TxInfAndSts>
+      <TxInfAndSts>
+        <TxSts>RVMC</TxSts>
+        <StsRsnInf><AddtlInf>“Bob Bauer”</AddtlInf></StsRsnInf>
+        <OrgnlTxRef>
+          <Amt><InstdAmt Ccy="EUR">100.50</InstdAmt></Amt>
+          <Cdtr><Pty><Nm>Erika Musterfrah</Nm></Pty></Cdtr>
+          <CdtrAcct><Id><IBAN>DE75512108001245126199</IBAN></Id></CdtrAcct>
+        </OrgnlTxRef>
+      </TxInfAndSts>
+    </OrgnlPmtInfAndSts>
+  </CstmrPmtStsRpt>
+</Document>"""
+    let items = parseVopReport(report)
+    check items.len == 2
+    check items[0].code == "RCVC"
+    check items[0].submittedName == "Bob Bauers"
+    check items[0].iban == "DE02120300000000202051"
+    check items[0].amount == "10.00"
+    check items[1].code == "RVMC"
+    # banks wrap the suggested name in typographic quotes — strip them
+    check items[1].actualName == "Bob Bauer"
+    check items[1].submittedName == "Erika Musterfrah"
+
+  test "block-level status without TxInfAndSts":
+    let report = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:pain.002.001.10">
+  <CstmrPmtStsRpt><OrgnlPmtInfAndSts>
+    <OrgnlPmtInfId>P1</OrgnlPmtInfId>
+    <PmtInfSts>RVNA</PmtInfSts>
+  </OrgnlPmtInfAndSts></CstmrPmtStsRpt>
+</Document>"""
+    let items = parseVopReport(report)
+    check items.len == 1
+    check items[0].code == "RVNA"
+    check items[0].submittedName == ""
+
 when isMainModule:
   discard

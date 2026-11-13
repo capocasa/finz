@@ -261,6 +261,32 @@ proc buildHKCAZ*(segNum: int, account: Account, fromDate, toDate: string, camtUr
     data.add(offset)
   result = buildSegment("HKCAZ", version, segNum, data)
 
+proc buildHKSAL*(segNum: int, account: Account, allAccounts: bool = false, version: int = 7): string =
+  ## Build HKSAL segment (Saldenabfrage) for querying the account balance.
+  ## Account DEG follows the same version conventions as HKKAZ.
+  var data: seq[string]
+  let accountNum = if account.number.len > 0: account.number else: deriveAccountNumber(account.iban)
+  let subaccount = account.subaccount
+
+  if version >= 7:
+    # HKSAL version 7: KTI format
+    var kti = account.iban
+    if account.bic.len > 0:
+      kti.add(":" & account.bic)
+    data = @[kti, if allAccounts: "J" else: "N"]
+  elif version == 6:
+    # HKSAL version 6: KTV format
+    var ktv = account.iban
+    if account.bic.len > 0:
+      ktv.add(":" & account.bic)
+    ktv.add(":" & accountNum & ":" & subaccount & ":280:" & account.blz)
+    data = @[ktv, if allAccounts: "J" else: "N"]
+  else:
+    # HKSAL version 5 and below: KTO format
+    let kto = accountNum & ":" & subaccount & ":280:" & account.blz
+    data = @[kto, if allAccounts: "J" else: "N"]
+  result = buildSegment("HKSAL", version, segNum, data)
+
 proc parseSegments(msg: string): seq[Segment] =
   ## Parse FinTS message into segments
   result = @[]
@@ -401,6 +427,35 @@ proc parseAllSegments*(msg: string): seq[Segment] =
     result = outerSegments & innerSegments
   else:
     result = outerSegments
+
+proc parseHISAL*(seg: Segment): Saldo =
+  ## Parse a HISAL segment into a Saldo.
+  ## Data fields: account, account_product, currency, booked balance DEG
+  ## (C/D:amount:currency:date[:time]), pending balance DEG, credit line,
+  ## available amount, used amount, ...
+  result = Saldo()
+  if seg.data.len > 2:
+    result.currency = seg.data[2]
+  if seg.data.len > 3:
+    # Balance DEG serializes identically for Balance1 (v5) and Balance2 (v6+):
+    # credit_debit:amount:currency:date[:time]
+    let fields = seg.data[3].split(':')
+    if fields.len >= 2:
+      let amount = fields[1].replace(",", ".").parseFloat
+      result.balance = if fields[0] == "D": -amount else: amount
+    if fields.len >= 4:
+      result.date = fields[3]
+  if seg.data.len > 4:
+    # Pending balance: same DEG layout as booked
+    let fields = seg.data[4].split(':')
+    if fields.len >= 2:
+      let amount = fields[1].replace(",", ".").parseFloat
+      result.pending = if fields[0] == "D": -amount else: amount
+  if seg.data.len > 6:
+    # Available amount: Amount1 DEG amount:currency
+    let fields = seg.data[6].split(':')
+    if fields.len >= 1 and fields[0].len > 0:
+      result.available = fields[0].replace(",", ".").parseFloat
 
 proc parseResponse*(de: string): tuple[code: string, refSeg: string, msg: string] =
   ## Parse HIRMG/HIRMS data element: "code:refSeg:message" or "code::message"

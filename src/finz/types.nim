@@ -33,6 +33,7 @@ type
     updVersion*: int
     supportedTanMethods*: seq[TanMethod]
     supportsInstantPayment*: bool
+    supportsInstantBatch*: bool  # HKIPM (SEPA instant Sammelüberweisung)
 
   Account* = object
     iban*: string
@@ -41,6 +42,16 @@ type
     subaccount*: string
     blz*: string
     holder*: string
+
+  VopItem* = object
+    ## One Verification-of-Payee result. Single transfers yield one item
+    ## (from the HIVPP result DEG); batch transfers one per payment (from
+    ## the pain.002 status report the bank returns instead).
+    iban*: string
+    submittedName*: string   # name as sent by us (pain.002 OrgnlTxRef)
+    actualName*: string      # name suggested by the bank (close match)
+    amount*: string
+    code*: string            # RCVC match, RVMC close, RVNM no match, RVNA unavailable
 
   TransferRequest* = object
     recipientName*: string
@@ -59,6 +70,7 @@ type
     orderRef*: string
     errorCode*: string
     errorMsg*: string
+    vopItems*: seq[VopItem]  # payee verification result per payment (batch: N)
 
   Transaction* = object
     date*: string           # Booking date (YYYYMMDD)
@@ -81,3 +93,20 @@ type
     orderRef*: string
     tanChallenge*: string
     nextOffset*: string
+
+  Saldo* = object
+    ## Balance from a HISAL response (booked balance plus extras).
+    balance*: float         ## booked balance (Saldo), negative if in debit
+    currency*: string
+    date*: string           # balance date YYYYMMDD
+    pending*: float         # pending/registered amount (0 if not reported)
+    available*: float       # verfügbarer Betrag (0 if not reported)
+
+  BalanceResult* = object
+    success*: bool
+    saldo*: Saldo
+    errorCode*: string
+    errorMsg*: string
+    tanRequired*: bool
+    orderRef*: string
+    tanChallenge*: string
